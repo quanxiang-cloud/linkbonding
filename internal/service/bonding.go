@@ -53,6 +53,10 @@ type InsertEdgeReq struct {
 	Start  node              `json:"start,omitempty"`
 	End    node              `json:"end,omitempty"`
 	Lables map[string]string `json:"labels,omitempty"`
+
+	// UID The business party should ensure that
+	// the id is globally unique and can be traced back
+	UID string `json:"uid,omitempty"`
 }
 
 // InsertEdgeResp insert edge resp
@@ -61,7 +65,6 @@ type InsertEdgeResp struct {
 
 // TODO should break cycle?
 // TODO nodes are critical resources and need to use distributed lock control.
-// TODO reference counter
 // InsertEdge add an edge to a graph or generate a graph with only two vertices
 func (b *Bonding) InsertEdge(ctx context.Context, req *InsertEdgeReq) (*InsertEdgeResp, error) {
 	start, err := b.getNode(ctx, req.Start.EndPoint)
@@ -73,14 +76,17 @@ func (b *Bonding) InsertEdge(ctx context.Context, req *InsertEdgeReq) (*InsertEd
 		return &InsertEdgeResp{}, err
 	}
 
-	if start.GetNext(req.End.EndPoint) == nil {
+	var next *v1alpha1.Edge
+	uid := v1alpha1.UID + "/" + req.UID
+	if next = start.GetNext(req.End.EndPoint); next == nil {
+		next = &v1alpha1.Edge{
+			EndPoint: req.End.EndPoint,
+		}
+
 		if len(start.Nexts) == 0 {
 			start.Nexts = make([]*v1alpha1.Edge, 0)
 		}
-		start.Nexts = append(start.Nexts, &v1alpha1.Edge{
-			EndPoint: req.End.EndPoint,
-			Labels:   req.Lables,
-		})
+		start.Nexts = append(start.Nexts, next)
 
 		if len(end.Pres) == 0 {
 			end.Pres = make([]*v1alpha1.Edge, 0)
@@ -88,6 +94,17 @@ func (b *Bonding) InsertEdge(ctx context.Context, req *InsertEdgeReq) (*InsertEd
 		end.Pres = append(end.Pres, &v1alpha1.Edge{
 			EndPoint: req.Start.EndPoint,
 		})
+	}
+
+	if len(next.Labels) == 0 {
+		next.Labels = map[string]map[string]interface{}{}
+	}
+	if len(next.Labels[uid]) == 0 {
+		next.Labels[uid] = make(map[string]interface{})
+	}
+
+	for key, value := range req.Lables {
+		next.Labels[uid][key] = value
 	}
 
 	if err := b.nodeRepo.Insert(ctx, start); err != nil {
@@ -102,9 +119,9 @@ func (b *Bonding) InsertEdge(ctx context.Context, req *InsertEdgeReq) (*InsertEd
 
 // DeleteEdgeReq delete edge req
 type DeleteEdgeReq struct {
-	Start  node              `json:"start,omitempty"`
-	End    node              `json:"end,omitempty"`
-	Lables map[string]string `json:"labels,omitempty"`
+	Start node   `json:"start,omitempty"`
+	End   node   `json:"end,omitempty"`
+	UID   string `json:"uid,omitempty"`
 }
 
 // DeleteEdgeResp delete edge resp
@@ -123,44 +140,28 @@ func (b *Bonding) DeleteEdge(ctx context.Context, req *DeleteEdgeReq) (*DeleteEd
 		return &DeleteEdgeResp{}, err
 	}
 
-	ends := make([]*v1alpha1.Node, 0)
-	switch {
-	case req.End.EndPoint != "":
-		end, err := b.nodeRepo.GetNode(ctx, req.End.EndPoint)
+	endEndPoints := make([]v1alpha1.EndPoint, 0)
+	for index, next := range start.Nexts {
+		uid := v1alpha1.UID + "/" + req.UID
+		if _, ok := next.Labels[uid]; ok &&
+			(req.End.EndPoint == "" ||
+				req.End.EndPoint == next.EndPoint) {
+			// delete the specified key
+			delete(next.Labels, uid)
+
+			// delete edge
+			if len(next.Labels) == 0 {
+				endEndPoints = append(endEndPoints, next.EndPoint)
+				start.Nexts = append(start.Nexts[:index], start.Nexts[index+1:]...)
+			}
+		}
+	}
+
+	for _, endPoints := range endEndPoints {
+		end, err := b.nodeRepo.GetNode(ctx, endPoints)
 		if err != nil {
 			return &DeleteEdgeResp{}, err
 		}
-		if end != nil {
-			ends = append(ends, end)
-		}
-
-	case len(req.Lables) != 0:
-	Next:
-		for _, next := range start.Nexts {
-			if len(next.Labels) == 0 {
-				continue
-			}
-			for key, value := range req.Lables {
-				if next.Labels[key] != value {
-					continue Next
-				}
-			}
-			end, err := b.nodeRepo.GetNode(ctx, next.EndPoint)
-			if err != nil {
-				return &DeleteEdgeResp{}, err
-			}
-			if end == nil {
-				continue
-			}
-
-			ends = append(ends, end)
-		}
-	default:
-		// nothing to do
-		return &DeleteEdgeResp{}, nil
-	}
-
-	for _, end := range ends {
 		for i, pre := range end.Pres {
 			if pre.EndPoint == req.Start.EndPoint {
 				end.Pres = append(end.Pres[:i], end.Pres[i+1:]...)
@@ -172,15 +173,6 @@ func (b *Bonding) DeleteEdge(ctx context.Context, req *DeleteEdgeReq) (*DeleteEd
 		}
 	}
 
-	for i, next := range start.Nexts {
-		for _, end := range ends {
-			if next.EndPoint == end.EndPoint {
-				start.Nexts = append(start.Nexts[:i], start.Nexts[i+1:]...)
-				break
-			}
-		}
-	}
-
 	if err := b.updateOrdelete(ctx, start); err != nil {
 		return &DeleteEdgeResp{}, err
 	}
@@ -188,6 +180,7 @@ func (b *Bonding) DeleteEdge(ctx context.Context, req *DeleteEdgeReq) (*DeleteEd
 	return &DeleteEdgeResp{}, nil
 }
 
+// updateOrdelete if the node is an orphan node, delete it
 func (b *Bonding) updateOrdelete(ctx context.Context, node *v1alpha1.Node) error {
 	if node == nil {
 		return nil

@@ -2,9 +2,15 @@ package v1alpha1
 
 type EndPoint string
 
+const (
+	UID = "resource.id"
+)
+
 type Edge struct {
-	EndPoint EndPoint          `json:"endPoint,omitempty"`
-	Labels   map[string]string `json:"labels,omitempty"`
+	// EndPoint endpoint inique id
+	EndPoint EndPoint `json:"endPoint,omitempty"`
+
+	Labels map[string]map[string]interface{} `json:"labels,omitempty"`
 }
 
 type Node struct {
